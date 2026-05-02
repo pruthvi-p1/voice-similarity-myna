@@ -1,15 +1,33 @@
 """FastAPI backend for voice similarity"""
 
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Repo root: backend/app/main.py -> parents[2]
-REPO_ROOT = Path(__file__).resolve().parents[2]
-REFERENCE_DATA_DIR = REPO_ROOT / "reference_data"
+from app.reference_profiles import build_reference_profiles
 
-app = FastAPI(title="Voice Similarity API", version="0.1.0")
+REFERENCE_DATA = Path("../reference_data")
+
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Precompute MFCC fingerprints for all reference vocalists once at startup."""
+    app.state.reference_profiles = build_reference_profiles(REFERENCE_DATA)
+    logger.info(
+        "loaded %d reference fingerprints from %s",
+        len(app.state.reference_profiles),
+        REFERENCE_DATA,
+    )
+    yield
+
+
+app = FastAPI(title="Voice Similarity API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,3 +44,11 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/preload-status")
+def preload_status():
+    profiles = getattr(app.state, "reference_profiles", None)
+    return {
+        "Sample Data loaded": profiles is not None,
+        "Sample Data count": len(profiles) if profiles else 0,
+    }
