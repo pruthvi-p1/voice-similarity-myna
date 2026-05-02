@@ -1,0 +1,45 @@
+.app {
+  max-width: 42rem;
+  margin: 0 auto;
+  padding: 2rem 1.25rem;
+}
+
+.app h1 {
+  font-size: 1.75rem;
+  margin: 0 0 0.5rem;
+}
+
+.lede {
+  margin: 0 0 1.5rem;
+  color: var(--text);
+}
+
+.panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  background: var(--code-bg);
+}
+
+.panel h2 {
+  font-size: 1rem;
+  margin: 0 0 0.75rem;
+}
+
+.error {
+  color: #b91c1c;
+  margin: 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .error {
+    color: #fca5a5;
+  }
+}
+
+.json {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  overflow: auto;
+}
