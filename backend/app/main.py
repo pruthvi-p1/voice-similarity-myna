@@ -4,10 +4,12 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.compare import CompareInputError, compare_upload_to_references
 from app.reference_profiles import build_reference_profiles
+from app.schemas_compare import CompareResponse, SimilarityRow
 
 REFERENCE_DATA = Path("../reference_data")
 
@@ -52,3 +54,34 @@ def preload_status():
         "Sample Data loaded": profiles is not None,
         "Sample Data count": len(profiles) if profiles else 0,
     }
+
+
+@app.post("/compare", response_model=CompareResponse)
+async def compare(request: Request, audio: UploadFile = File(...)):
+    """
+    Compare MFCC fingerprint of users audio against all reference vocalists.
+    """
+    profiles = getattr(request.app.state, "reference_profiles", None)
+    if not profiles:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "reference profiles unavailable",
+                "code": "service_unavailable",
+            },
+        )
+
+    data = await audio.read()
+    try:
+        ranked = compare_upload_to_references(data, audio.content_type, profiles)
+    except CompareInputError as e:
+        raise HTTPException(
+            status_code=e.status_code,
+            detail={"message": e.message, "code": e.code},
+        ) from e
+
+    return CompareResponse(
+        similarities=[
+            SimilarityRow(reference_id=k, cosine_similarity=s) for k, s in ranked
+        ]
+    )
