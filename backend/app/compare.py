@@ -4,19 +4,20 @@ Compare uploaded audio against reference profiles.
 
 from __future__ import annotations
 
-import logging
+import subprocess
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
+import librosa
 import numpy as np
 
 from app.audio_pipeline import SR, load_mono, mfcc_fingerprint
 
-logger = logging.getLogger(__name__)
-
 MIN_DURATION_SEC = 5.0
 MAX_DURATION_SEC = 10.0
+# Wall-clock / encoder padding often yields ~10.0x s from the client; allow a small ceiling.
+DURATION_UPPER_SLACK_SEC = 0.35
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
 ALLOWED_AUDIO_MEDIA_TYPES: frozenset[str] = frozenset(
@@ -66,38 +67,69 @@ def _media_type_to_suffix(media_type: str) -> str:
     return _MEDIA_TYPE_TO_SUFFIX.get(media_type, ".bin")
 
 
-def _decode_upload_to_mono(data: bytes, media_type: str) -> np.ndarray:
-    """
-    Write bytes to a temp file with a sensible extension and load at SR mono.
-
-    Requires ffmpeg (or decodable format) for webm/mp4/opus etc.
-    """
-    suffix = _media_type_to_suffix(media_type)
+def _write_temp(suffix: str, data: bytes) -> Path:
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-    tmp_path = Path(tmp.name)
+    path = Path(tmp.name)
+    tmp.write(data)
+    tmp.close()
+    return path
+
+
+def _decode_upload_to_mono(data: bytes, media_type: str) -> np.ndarray:
+    """WAV: load directly. Other formats: convert to mono SR Hz WAV with ffmpeg, then load."""
+    if media_type in ("audio/wav", "audio/x-wav", "audio/wave"):
+        in_path = _write_temp(".wav", data)
+        try:
+            y, _ = load_mono(in_path)
+            return y
+        finally:
+            in_path.unlink(missing_ok=True)
+
+    in_path = _write_temp(_media_type_to_suffix(media_type), data)
+    out_path = in_path.with_suffix(".mono44100.wav")
     try:
-        tmp.write(data)
-        tmp.close()
-        y, _ = load_mono(tmp_path)
+        # ffmpeg: decode webm/mp4/… → mono WAV @ SR (librosa cannot read those formats directly).
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(in_path),
+                "-ar",
+                str(SR),
+                "-ac",
+                "1",
+                "-f",
+                "wav",
+                str(out_path),
+            ],
+            check=True,
+            timeout=120,
+        )
+        y, _ = load_mono(out_path)
         return y
     finally:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        in_path.unlink(missing_ok=True)
+        out_path.unlink(missing_ok=True)
 
 
 def _assert_listenable_upload(y: np.ndarray) -> None:
-    """Reject empty or effectively silent recordings before fingerprinting."""
     if y.size == 0:
         raise CompareInputError(
             "no audio data detected, try again",
             "no_audio_data",
             400,
         )
-    rms = float(np.sqrt(np.mean(np.square(y))))
-    peak = float(np.max(np.abs(y)))
-    if rms < 1e-5 and peak < 1e-4:
+
+    rms_frames = librosa.feature.rms(y=y, frame_length=2048, hop_length=512, center=True)[
+        0
+    ]
+    max_frame_rms = float(np.max(rms_frames)) if rms_frames.size > 0 else 0.0
+    if max_frame_rms < 0.004:
         raise CompareInputError(
             "no audio data detected, try again",
             "no_audio_data",
@@ -108,22 +140,13 @@ def _assert_listenable_upload(y: np.ndarray) -> None:
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     a64 = np.asarray(a, dtype=np.float64)
     b64 = np.asarray(b, dtype=np.float64)
-    na = np.linalg.norm(a64)
-    nb = np.linalg.norm(b64)
-    if na < 1e-12 or nb < 1e-12:
-        raise CompareInputError(
-            "no audio data detected, try again",
-            "no_audio_data",
-            400,
-        )
-    return float(np.dot(a64, b64) / (na * nb))
+    return float(np.dot(a64, b64) / (np.linalg.norm(a64) * np.linalg.norm(b64)))
 
 
 def rank_references(
     query_fp: np.ndarray,
     reference_profiles: Mapping[str, np.ndarray],
 ) -> list[tuple[str, float]]:
-    """Cosine similarity vs every reference, best match first."""
     ranked = [
         (key, cosine_similarity(query_fp, ref_fp))
         for key, ref_fp in reference_profiles.items()
@@ -166,15 +189,7 @@ def compare_upload_to_references(
     if len(data) > MAX_UPLOAD_BYTES:
         raise CompareInputError("file too large", "payload_too_large", 413)
 
-    try:
-        y = _decode_upload_to_mono(data, media)
-    except Exception:
-        logger.exception("decode failed for media_type=%s", media)
-        raise CompareInputError(
-            "could not decode audio",
-            "decode_failed",
-            400,
-        ) from None
+    y = _decode_upload_to_mono(data, media)
 
     duration = float(len(y)) / float(SR)
     if duration < MIN_DURATION_SEC:
@@ -183,7 +198,7 @@ def compare_upload_to_references(
             "duration_too_short",
             400,
         )
-    if duration > MAX_DURATION_SEC:
+    if duration > MAX_DURATION_SEC + DURATION_UPPER_SLACK_SEC:
         raise CompareInputError(
             "recording must be at most 10 seconds",
             "duration_too_long",
