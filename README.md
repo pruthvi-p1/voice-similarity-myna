@@ -29,12 +29,30 @@ npm run dev
 
 Open the URL Vite prints (usually `http://127.0.0.1:5173`). The UI calls the API through a dev proxy: browser requests go to `/api/*`, and Vite forwards them to `http://127.0.0.1:8000/*`.
 
+## Tests
+
+**Backend** 
+
+```bash
+cd backend
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python -m pytest
+```
+
+**Frontend** 
+
+```bash
+cd frontend
+npm install
+npm run test
+```
+
 ## Layout
 
 | Path | Role |
 |------|------|
-| `backend/app/main.py` | FastAPI app, CORS, health + reference listing |
-| `frontend/` | Vite + React + TypeScript |
+| `backend/app/main.py` | FastAPI app, CORS, `/health`, `/compare` |
+| `backend/tests/` | Pytest: compare math, audio pipeline, API smoke |
+| `frontend/` | Vite + React + TypeScript; `src/lib/*.test.ts` for unit tests |
 | `reference_data/` | `sample_1.wav` … `sample_10.wav` |
-
-Next steps for the assignment: upload/compare endpoint, MFCC (or mel) pipeline, precomputed reference profiles, MediaRecorder on the frontend, tests, and README sections on approach and trade-offs.

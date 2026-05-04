@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import './App.css'
 
+import { parseApiError } from './lib/apiError'
+import { angularSimilarityPercent, similarityBarWidthPct } from './lib/similarity'
+
 type CompareSimilarity = {
   reference_id: string
   cosine_similarity: number
@@ -8,37 +11,6 @@ type CompareSimilarity = {
 
 type CompareResponse = {
   similarities: CompareSimilarity[]
-}
-
-type ApiErrorDetail =
-  | string
-  | { message?: string; code?: string }
-  | undefined
-
-function parseApiError(status: number, body: unknown): string {
-  if (
-    body != null &&
-    typeof body === 'object' &&
-    'detail' in body &&
-    (body as { detail: ApiErrorDetail }).detail != null
-  ) {
-    const d = (body as { detail: ApiErrorDetail }).detail
-    if (typeof d === 'string') return d
-    if (typeof d === 'object' && d.message) return d.message
-  }
-  return `Request failed (${status})`
-}
-
-/** Cosine in [-1, 1] → angular similarity %: 100% aligned, 0% opposite. */
-function angularSimilarityPercent(cosine: number): number {
-  const c = Math.max(-1, Math.min(1, cosine))
-  return (1 - Math.acos(c) / Math.PI) * 100
-}
-
-/** Map a score into [0, 100] bar width where min → 0% and max → 100% of this result set. */
-function similarityBarWidthPct(value: number, min: number, max: number): number {
-  if (max <= min) return 100
-  return ((value - min) / (max - min)) * 100
 }
 
 const MIN_RECORD_SEC = 5
