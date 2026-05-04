@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import './App.css'
 
 type CompareSimilarity = {
@@ -27,6 +27,18 @@ function parseApiError(status: number, body: unknown): string {
     if (typeof d === 'object' && d.message) return d.message
   }
   return `Request failed (${status})`
+}
+
+/** Cosine in [-1, 1] → angular similarity %: 100% aligned, 0% opposite. */
+function angularSimilarityPercent(cosine: number): number {
+  const c = Math.max(-1, Math.min(1, cosine))
+  return (1 - Math.acos(c) / Math.PI) * 100
+}
+
+/** Map a score into [0, 100] bar width where min → 0% and max → 100% of this result set. */
+function similarityBarWidthPct(value: number, min: number, max: number): number {
+  if (max <= min) return 100
+  return ((value - min) / (max - min)) * 100
 }
 
 const MIN_RECORD_SEC = 5
@@ -58,6 +70,14 @@ function extensionForMime(mime: string): string {
   return '.bin'
 }
 
+function getAudioContextClass(): typeof AudioContext | null {
+  const w = window as unknown as {
+    AudioContext?: typeof AudioContext
+    webkitAudioContext?: typeof AudioContext
+  }
+  return w.AudioContext ?? w.webkitAudioContext ?? null
+}
+
 export default function App() {
   const [phase, setPhase] = useState<'idle' | 'recording' | 'ready'>('idle')
   const [elapsedSec, setElapsedSec] = useState(0)
@@ -68,12 +88,117 @@ export default function App() {
   const [compareLoading, setCompareLoading] = useState(false)
   const [compareError, setCompareError] = useState<string | null>(null)
   const [compareResult, setCompareResult] = useState<CompareResponse | null>(null)
+  const [showScoringHelp, setShowScoringHelp] = useState(false)
+  const scoringHelpPanelId = useId()
 
   const chunksRef = useRef<Blob[]>([])
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const tickRef = useRef<number | null>(null)
   const recordStartedAtRef = useRef<number>(0)
+
+  const spectrogramCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const spectrogramRafRef = useRef<number | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const analyserRef = useRef<AnalyserNode | null>(null)
+  const spectrogramActiveRef = useRef(false)
+
+  const stopSpectrogram = useCallback(() => {
+    spectrogramActiveRef.current = false
+    if (spectrogramRafRef.current != null) {
+      cancelAnimationFrame(spectrogramRafRef.current)
+      spectrogramRafRef.current = null
+    }
+    analyserRef.current = null
+    const ac = audioContextRef.current
+    audioContextRef.current = null
+    void ac?.close()
+
+    const canvas = spectrogramCanvasRef.current
+    if (canvas != null) {
+      const ctx = canvas.getContext('2d')
+      if (ctx != null) {
+        const wrap = canvas.closest('.spectrogram-wrap')
+        const bg =
+          (wrap && getComputedStyle(wrap).getPropertyValue('--spectrogram-bg').trim()) ||
+          '#14151a'
+        ctx.fillStyle = bg
+        ctx.fillRect(0, 0, canvas.width, canvas.height)
+      }
+    }
+  }, [])
+
+  const startSpectrogram = useCallback(
+    (stream: MediaStream) => {
+      stopSpectrogram()
+
+      const AudioCtx = getAudioContextClass()
+      const canvas = spectrogramCanvasRef.current
+      if (AudioCtx == null || canvas == null) return
+
+      const audioCtx = new AudioCtx()
+      audioContextRef.current = audioCtx
+      void audioCtx.resume()
+
+      const source = audioCtx.createMediaStreamSource(stream)
+      const analyser = audioCtx.createAnalyser()
+      analyser.fftSize = 2048
+      analyser.smoothingTimeConstant = 0.68
+      source.connect(analyser)
+      analyserRef.current = analyser
+
+      const dpr = Math.min(window.devicePixelRatio ?? 1, 2)
+      const rect = canvas.getBoundingClientRect()
+      let w = Math.max(1, Math.floor(rect.width * dpr))
+      let h = Math.max(1, Math.floor(rect.height * dpr))
+      if (w < 8 || h < 8) {
+        w = Math.floor(640 * dpr)
+        h = Math.floor(160 * dpr)
+      }
+      canvas.width = w
+      canvas.height = h
+
+      const g = canvas.getContext('2d')
+      if (g == null) return
+
+      const wrapEl = canvas.closest('.spectrogram-wrap')
+      const bg =
+        (wrapEl && getComputedStyle(wrapEl).getPropertyValue('--spectrogram-bg').trim()) ||
+        '#14151a'
+      g.fillStyle = bg
+      g.fillRect(0, 0, w, h)
+
+      const freqData = new Uint8Array(analyser.frequencyBinCount)
+      const stripW = Math.max(1, Math.round(dpr))
+
+      spectrogramActiveRef.current = true
+
+      const draw = () => {
+        if (!spectrogramActiveRef.current || analyserRef.current == null) return
+
+        const a = analyserRef.current
+        a.getByteFrequencyData(freqData)
+        const n = freqData.length
+
+        g.drawImage(canvas, stripW, 0, w - stripW, h, 0, 0, w - stripW, h)
+
+        for (let y = 0; y < h; y++) {
+          const bin = Math.min(n - 1, Math.floor((1 - y / h) * n * 0.92))
+          const v = freqData[bin]! / 255
+          const r = Math.floor(18 + v * 210)
+          const gCh = Math.floor(12 + v * 95)
+          const b = Math.floor(35 + v * 210)
+          g.fillStyle = `rgb(${r},${gCh},${b})`
+          g.fillRect(w - stripW, y, stripW, 1)
+        }
+
+        spectrogramRafRef.current = requestAnimationFrame(draw)
+      }
+
+      spectrogramRafRef.current = requestAnimationFrame(draw)
+    },
+    [stopSpectrogram],
+  )
 
   const clearTick = () => {
     if (tickRef.current != null) {
@@ -88,6 +213,7 @@ export default function App() {
   }
 
   const stopRecording = useCallback(() => {
+    stopSpectrogram()
     clearTick()
     const rec = mediaRecorderRef.current
     mediaRecorderRef.current = null
@@ -97,7 +223,7 @@ export default function App() {
       stopStream()
       setPhase('idle')
     }
-  }, [])
+  }, [stopSpectrogram])
 
   const startRecording = async () => {
     setMicError(null)
@@ -160,6 +286,8 @@ export default function App() {
     setPhase('recording')
     recorder.start(200)
 
+    queueMicrotask(() => startSpectrogram(stream))
+
     const tick = () => {
       const t = (Date.now() - recordStartedAtRef.current) / 1000
       setElapsedSec(t)
@@ -173,9 +301,10 @@ export default function App() {
   }
 
   useEffect(() => () => {
+    stopSpectrogram()
     clearTick()
     stopStream()
-  }, [])
+  }, [stopSpectrogram])
 
   const submitCompare = async () => {
     if (recordedBlob == null || recordedBlob.size === 0) return
@@ -218,6 +347,7 @@ export default function App() {
   }
 
   const discardRecording = () => {
+    stopSpectrogram()
     clearTick()
     mediaRecorderRef.current = null
     stopStream()
@@ -227,6 +357,7 @@ export default function App() {
     setPhase('idle')
     setCompareError(null)
     setCompareResult(null)
+    setShowScoringHelp(false)
   }
 
   const canSubmit =
@@ -237,21 +368,25 @@ export default function App() {
     elapsedSec <= MAX_RECORD_SEC + DURATION_UPPER_SLACK_SEC &&
     !compareLoading
 
+  const resultSimilarityPercents =
+    compareResult?.similarities.map((row) =>
+      angularSimilarityPercent(row.cosine_similarity),
+    ) ?? []
+  const resultMinPct =
+    resultSimilarityPercents.length > 0
+      ? Math.min(...resultSimilarityPercents)
+      : 0
+  const resultMaxPct =
+    resultSimilarityPercents.length > 0
+      ? Math.max(...resultSimilarityPercents)
+      : 0
+
   return (
     <main className="app">
       <h1>Voice Similarity</h1>
       
       <section className="panel record-panel" aria-labelledby="record-heading">
         <h2 id="record-heading"> Record yourself singing or talking, then compare your voice against our vocalists.</h2>
-        <p className="hint">
-          
-        </p>
-
-        {micError != null && (
-          <p className="error" role="alert">
-            {micError}
-          </p>
-        )}
 
         <div className="record-row">
           {phase === 'idle' && (
@@ -260,19 +395,14 @@ export default function App() {
             </button>
           )}
           {phase === 'recording' && (
-            <>
-              <button
-                type="button"
-                className="btn btn-danger"
-                onClick={stopRecording}
-                aria-pressed="true"
-              >
-                Stop
-              </button>
-              <span className="timer" aria-live="polite">
-                {elapsedSec.toFixed(1)}s / {MAX_RECORD_SEC}s
-              </span>
-            </>
+            <button
+              type="button"
+              className="btn btn-danger"
+              onClick={stopRecording}
+              aria-pressed="true"
+            >
+              Stop
+            </button>
           )}
           {phase === 'ready' && (
             <>
@@ -285,39 +415,166 @@ export default function App() {
                 {compareLoading ? 'Comparing…' : 'Compare'}
               </button>
               <button type="button" className="btn btn-ghost" onClick={discardRecording}>
-               Re-record
+                Re-record
               </button>
+            </>
+          )}
+        </div>
+
+        {(micError != null ||
+          compareError != null ||
+          phase === 'recording' ||
+          phase === 'ready') && (
+          <div className="record-status">
+            {micError != null ? (
+              <p className="error record-status-message" role="alert">
+                {micError}
+              </p>
+            ) : compareError != null ? (
+              <p className="error record-status-message" role="alert">
+                {compareError}
+              </p>
+            ) : phase === 'recording' ? (
+              <span className="timer" aria-live="polite">
+                {elapsedSec.toFixed(1)}s / {MAX_RECORD_SEC}s
+              </span>
+            ) : (
               <span className="timer">
                 Clip: {elapsedSec.toFixed(1)}s
                 {elapsedSec < MIN_RECORD_SEC && (
                   <span className="warn"> (need at least {MIN_RECORD_SEC}s)</span>
                 )}
               </span>
-            </>
-          )}
-        </div>
-
-        {compareError != null && (
-          <p className="error compare-error" role="alert">
-            {compareError}
-          </p>
+            )}
+          </div>
         )}
+
+        <div
+          className={`spectrogram-wrap${phase === 'recording' ? ' spectrogram-wrap--active' : ''}`}
+          aria-hidden={phase !== 'recording'}
+        >
+          <p className="spectrogram-label">Live spectrogram</p>
+          <canvas
+            ref={spectrogramCanvasRef}
+            className="spectrogram-canvas"
+            width={800}
+            height={180}
+            role="img"
+            aria-label="Scrolling spectrogram of microphone input while recording"
+          />
+        </div>
       </section>
 
       {compareResult != null && (
         <section className="panel results-panel" aria-labelledby="results-heading">
-          <h2 id="results-heading">Similarity (most to least similar)</h2>
-          <ol className="rank-list">
-            {compareResult.similarities.map((row, i) => (
-              <li key={row.reference_id}>
-                <span className="rank-num">{i + 1}.</span>
-                <span className="ref-id">{row.reference_id}</span>
-                <span className="score">
-                  {(row.cosine_similarity * 100).toFixed(1)}% cosine
-                </span>
-              </li>
-            ))}
-          </ol>
+          <h2 id="results-heading">Similarity Scores</h2>
+          <table
+            className="similarity-table"
+            aria-labelledby="results-heading"
+          >
+            <thead>
+              <tr>
+                <th scope="col">Rank</th>
+                <th scope="col">Reference</th>
+                <th scope="col">Similarity</th>
+              </tr>
+            </thead>
+            <tbody>
+              {compareResult.similarities.map((row, i) => {
+                const pct = resultSimilarityPercents[i]
+                const barWidth = similarityBarWidthPct(
+                  pct,
+                  resultMinPct,
+                  resultMaxPct,
+                )
+                return (
+                  <tr key={row.reference_id}>
+                    <td className="rank-cell">{i + 1}</td>
+                    <td className="ref-id">{row.reference_id}</td>
+                    <td className="score-cell">
+                      <div className="score-cell-inner">
+                        <span className="score-value">{pct.toFixed(1)}%</span>
+                        <div
+                          className="similarity-bar-meter"
+                          role="meter"
+                          aria-valuemin={resultMinPct}
+                          aria-valuemax={resultMaxPct}
+                          aria-valuenow={pct}
+                          aria-label={`${pct.toFixed(1)}% similarity (within ${resultMinPct.toFixed(1)}% to ${resultMaxPct.toFixed(1)}% for this comparison)`}
+                        >
+                          <div className="similarity-bar-track">
+                            <div
+                              className="similarity-bar-fill"
+                              style={{ width: `${barWidth}%` }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+
+          <p className="footnote results-footnote">
+            Wonder where the score comes from?{' '}
+            <button
+              type="button"
+              className="link-button"
+              aria-expanded={showScoringHelp}
+              aria-controls={scoringHelpPanelId}
+              onClick={() => setShowScoringHelp((open) => !open)}
+            >
+              {showScoringHelp ? 'Hide it' : 'See the gist'}
+            </button>
+          </p>
+
+          {showScoringHelp && (
+            <div
+              id={scoringHelpPanelId}
+              className="similarity-help-panel"
+              role="region"
+              aria-label="How compare and similarity scoring work"
+            >
+              <h3 className="similarity-help-heading">Quick breakdown</h3>
+              <ul className="similarity-help-list">
+                <li>
+                  <strong>1. You hit Compare</strong> — Your file is posted to{' '}
+                  <code className="inline-code">/api/compare</code> (same as the backend’s{' '}
+                  <code className="inline-code">/compare</code>). That route runs the same steps on
+                  your audio that it already ran on every reference file.
+                </li>
+                <li>
+                  <strong>2. Reference files</strong> — On server start, each{' '}
+                  <code className="inline-code">sample_1.wav</code> …{' '}
+                  <code className="inline-code">sample_10.wav</code> is read once and stored as a
+                  short list of numbers (a fingerprint). Those don’t change between requests.
+                </li>
+                <li>
+                  <strong>3. Your audio file</strong> — It’s turned into a single-channel waveform at
+                  44.1 kHz. Stuff from the browser (e.g. WebM) is converted with ffmpeg first. It has
+                  to be about 5–10 seconds long; if it’s basically silent, the server says no.
+                </li>
+                <li>
+                  <strong>4. Fingerprint</strong> — Librosa builds 13 MFCC features (a standard
+                  “shape of the sound” summary), averages them across the whole clip, then divides by
+                  length so every fingerprint has size 1. That way we compare tone, not volume.
+                </li>
+                <li>
+                  <strong>5. One score per reference</strong> — Your fingerprint is compared to each
+                  of the ten stored ones. Each comparison produces a single number from −1 to 1
+                  (higher = more alike). That number is cosine similarity on those two lists.
+                </li>
+                <li>
+                  <strong>6. What the table shows</strong> — The % is a display tweak on that
+                  number (angular similarity). The bar is only scaled between the lowest and highest %
+                  <em>in this table</em>, so you see who’s stronger or weaker among these ten, not vs
+                  a perfect 100% score.
+                </li>
+              </ul>
+            </div>
+          )}
         </section>
       )}
     </main>
